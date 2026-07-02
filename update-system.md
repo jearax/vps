@@ -1,0 +1,6 @@
+# Update VPS
+- Update full system
+
+```bash
+sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y && sudo apt clean -y
+```
