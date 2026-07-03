@@ -8,8 +8,9 @@ const bootstrap = () => {
 	};
 
 	const appConfig = {
-		...defaultAppConfig,
-		...process.env
+		name: process.env.APP_NAME ?? defaultAppConfig.name,
+		logLevel: process.env.LOG_LEVEL ?? defaultAppConfig.logLevel,
+		port: Number(process.env.APP_PORT ?? defaultAppConfig.port)
 	};
 
 	const server = http.createServer((req, res) => {

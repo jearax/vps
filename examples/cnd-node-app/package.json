@@ -9,7 +9,6 @@
     "build": "bun build.ts",
     "dev": "bun --watch src/index.ts",
     "start": "bun dist/index.js",
-    "deploy:local": "sh scripts/deploy.sh local",
     "deploy:develop": "sh scripts/deploy.sh develop",
     "deploy:production": "sh scripts/deploy.sh production"
   },

@@ -1,0 +1,26 @@
+services:
+  app:
+    image: ghcr.io/${GH_OWNER}/${REPO_NAME}:${IMAGE_TAG:-main}
+    container_name: ${REPO_NAME}
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    networks:
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.app.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.app.entrypoints=websecure
+      - traefik.http.routers.app.tls.certresolver=letsencrypt
+      - traefik.http.services.app.loadbalancer.server.port=3000
+    ports:
+      - '${CONTAINER_PORT:-3000}:3000'
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health/ready']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  dokploy-network:
+    external: true

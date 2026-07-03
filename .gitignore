@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Node / Bun
+node_modules
+dist
+build
+*.tsbuildinfo
+
+# env
+.env
+.env.*
+!.env.template
+!.env.example
+
+# editor / IDE
+.vscode
+.idea
+
+# misc
+*.log
