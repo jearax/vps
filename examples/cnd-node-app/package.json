@@ -1,0 +1,23 @@
+{
+  "name": "cdd-node-app",
+  "version": "0.0.1",
+  "description": "gcnd-ci demo: GitHub Actions -> Docker Hub -> VPS (Nginx/Docker), single service full case.",
+  "license": "ISC",
+  "author": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "bun build.ts",
+    "dev": "bun --watch src/index.ts",
+    "start": "bun dist/index.js",
+    "deploy:local": "sh scripts/deploy.sh local",
+    "deploy:develop": "sh scripts/deploy.sh develop",
+    "deploy:production": "sh scripts/deploy.sh production"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "keywords": [],
+  "packageManager": "bun@1.3.14"
+}
