@@ -193,6 +193,19 @@ networks:
 > **Vấn đề:** Dokploy bind `0.0.0.0:3000` (Docker Swarm `mode=host`) → dashboard bị lộ thẳng ra internet qua `IP:3000`. Cần chặn đường này, vẫn truy cập được qua subdomain `dokploy.<your_domain.com>`.
 > **Tham khảo chi tiết:** [Tại sao UFW vô tác dụng với Docker?](https://devops.vn/posts/tai-sao-ufw-vo-tac-dung-voi-docker/)
 
+**"Có login rồi, không có tài khoản thì vào sao được?"** Login chỉ bảo vệ bước xác thực, không bảo vệ đường truyền hay code chạy trước khi xác thực:
+
+| Đường tấn công | Vì sao login không chặn được |
+|---|---|
+| Nghe lén khi chính bạn login | `IP:3000` là HTTP thuần → password + session cookie đi plaintext qua Wi-Fi/router/ISP |
+| Lỗ hổng pre-auth (0-day) | Trang login/API là attack surface; bot quét toàn IPv4 tìm Dokploy ở `:3000` trong vài giờ sau khi CVE công bố |
+| Brute-force / credential stuffing | Không 2FA + password dùng lại |
+| Chuỗi lỗi sau login | Dokploy từng có nhiều CVE command injection/RCE (CVSS 9.4) cần login; lấy được session từ các đường trên là lên root |
+
+Dokploy điều khiển Docker socket → vào được panel ≈ root VPS (đọc mọi secret, DB, deploy image tuỳ ý). Admin panel không nên nằm public, kể cả khi có login.
+
+> Sau khi đóng `:3000`: **đổi password** nếu từng login qua `http://IP:3000`, và bật 2FA.
+
 **Vì sao UFW không chặn được `IP:3000`?**
 
 ```mermaid
@@ -237,7 +250,35 @@ Thực hiện gán domain cho trang quản trị trực tiếp trên giao diện
 
 *Ngay lúc này, bạn đã có thể truy cập an toàn vào giao diện Dokploy thông qua link: `https://dokploy.<your_domain.com>`*
 
-### 5.2. Bước 2 — Chặn `IP:3000` ở chain `DOCKER-USER`
+### 5.2. Bước 2 (khuyến nghị) — Tắt publish port 3000 bằng toggle có sẵn của Dokploy
+
+Dokploy có sẵn tuỳ chọn này, không cần firewall. Toggle **chỉ bật được khi đang truy cập panel qua domain** (để tránh tự khoá mình ở ngoài).
+
+1. Mở panel qua `https://dokploy.<your_domain.com>` (không dùng `IP:3000`).
+2. **Settings** ➔ **Web Server** ➔ bật tuỳ chọn tắt port 3000. Service restart vài giây (có thể thấy `502` tạm thời).
+
+Bản chất toggle là gỡ phần publish port của Swarm service; container vẫn chạy và Traefik vẫn gọi vào qua `dokploy-network`:
+
+```bash
+# Tương đương thủ công
+docker service update --publish-rm "published=3000,target=3000,mode=host" dokploy
+
+# Rollback nếu mất truy cập (SSH vào VPS)
+docker service update --publish-add published=3000,target=3000,mode=host dokploy
+```
+
+**Verify:**
+```bash
+docker service inspect dokploy --format '{{json .Endpoint.Spec.Ports}}'   # expect: null
+curl -I --max-time 5 http://<VPS_IP>:3000                                  # expect: timeout
+curl -I https://dokploy.<your_domain.com>                                  # expect: 200
+```
+
+Docs: [Dokploy Web Server](https://docs.dokploy.com/docs/core/web-server) · [Issue #947](https://github.com/Dokploy/dokploy/issues/947)
+
+### 5.3. Cách thay thế — Chặn `IP:3000` ở chain `DOCKER-USER`
+
+Chỉ dùng khi không muốn gỡ publish port (ví dụ cần `:3000` từ mạng nội bộ). Gỡ publish ở 5.2 gọn hơn vì không phải duy trì iptables rule qua reboot.
 
 ```bash
 # Detect external interface (KHÔNG hardcode eth0/ens3)
@@ -268,3 +309,163 @@ curl -I https://dokploy.<your_domain.com>           # expect: 200 (subdomain v�
 sudo iptables  -D DOCKER-USER -i $EXT_IF -p tcp --dport 3000 -j DROP
 sudo ip6tables -D DOCKER-USER -i $EXT_IF -p tcp --dport 3000 -j DROP
 ```
+
+## 6. Harden Traefik (Gateway)
+
+Traefik là cổng vào duy nhất của mọi app → cấu hình mặc định/debug cần siết lại trước khi chạy production. Sửa trong **Traefik File System** ➔ `traefik.yml`:
+
+| Key | Mặc định | Nên là | Rủi ro thật |
+|---|---|---|---|
+| `log.level` | `DEBUG` | `INFO` / `WARN` | Log debug có thể ghi header `Authorization`, `Cookie` → ai đọc được log là có token/session |
+| `api.insecure` | `true` | `false` | Mở dashboard `:8080` không auth. Chỉ nguy hiểm nếu `:8080` được publish — kiểm tra bằng `docker ps --filter name=traefik --format '{{.Ports}}'` |
+
+`traefik.yml` là **static config** → phải **restart** Traefik (Settings ➔ Web Server ➔ Traefik ➔ Reload), mọi site gián đoạn vài giây. File trong `dynamic/` thì hot-reload, không cần restart.
+
+## 7. Chặn truy cập trực tiếp Origin — SSL mode vs Authenticated Origin Pulls (AOP)
+
+> **Vấn đề:** Bật proxy cam chỉ giấu IP; ai biết IP VPS vẫn gọi thẳng `:443` (`curl --resolve <host>:443:<VPS_IP> https://<host>`) → bypass WAF, rate limit, Turnstile, CF Access.
+
+### 7.1. Hai chặng, hai chiều kiểm tra
+
+```
+Browser ──(chặng 1)──► Cloudflare ──(chặng 2)──► Origin (Traefik)
+          cert Edge của CF          ① CF kiểm tra cert của origin   ← SSL/TLS mode
+                                    ② Origin kiểm tra cert của CF   ← AOP
+```
+
+**SSL/TLS mode** (①) chỉ quy định Cloudflare đối xử với cert của origin — trả lời "*CF có đang nói chuyện đúng server không*":
+
+| Mode | Chặng 2 (CF → origin) |
+|---|---|
+| Off | Không HTTPS |
+| Flexible | HTTP thuần (không mã hoá) |
+| Full | HTTPS, CF **không verify** cert origin (self-signed cũng được) |
+| **Full (strict)** | HTTPS, CF **verify** cert origin (Let's Encrypt / Origin CA) |
+
+**AOP** (②) là chiều ngược lại: origin bắt Cloudflare trình client cert — trả lời "*người gọi tôi có đúng là Cloudflare (của tôi) không*". Bật Full (strict) **không** chặn được bypass; cần thêm AOP. Bật cả ① + ② = **mTLS** trên chặng 2.
+
+### 7.2. Ba mức bảo vệ origin
+
+| Mức | Cấu hình | Chặn được |
+|---|---|---|
+| 1 | Chỉ ① Full (strict) | Không chặn gọi thẳng origin |
+| 2 | ① + ② dùng **cert chung của Cloudflare** | Request không đi qua Cloudflare. Nhưng cert dùng chung mọi account → người khác tạo zone trỏ về IP bạn vẫn qua được |
+| 3 | ① + ② dùng **cert riêng** (zone-level) | Chỉ request đi qua **zone của bạn** — khuyến nghị |
+
+Hai chiều dùng hai cert khác nhau: server cert (Let's Encrypt) cho ①, client cert (CF hoặc của bạn) cho ②.
+
+### 7.3. Điều kiện trước khi bật
+
+- Mọi record trỏ về VPS phải **Proxied** (đám mây cam). Record `DNS only` ở bước 1 chỉ là tạm thời — bật cam lại sau khi setup xong. Host nào còn `DNS only` sẽ bị chặn khi bật AOP.
+- SSL/TLS mode = **Full (strict)** (AOP không chạy với Off/Flexible).
+- Cert dùng **DNS-01** (bước 3) → không ảnh hưởng. TLS-ALPN-01 sẽ vỡ khi bật mTLS.
+
+### 7.4. Setup (mức 3 — cert riêng)
+
+Flow đã chạy thật, theo thứ tự **mềm → bật CF → cứng** để không có lúc nào site bị chặn.
+
+**Bước 0 — Kiểm tra trước:** SSL/TLS mode = Full (strict); mọi record Proxied; các host trả 200. Với IdP (oidc-provider) `/` trả `404` là bình thường → health check bằng `/.well-known/openid-configuration`.
+
+**Bước 1 — Tạo CA + client cert (trên máy local, KHÔNG tạo trên VPS):**
+
+```bash
+mkdir -p ~/aop && chmod 700 ~/aop && cd ~/aop
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -subj "/CN=<your_domain.com> AOP CA" -keyout aop-ca.key -out aop-ca.pem
+openssl req -newkey rsa:2048 -nodes \
+  -subj "/CN=cloudflare-origin-pull" -keyout aop-client.key -out aop-client.csr
+openssl x509 -req -in aop-client.csr -CA aop-ca.pem -CAkey aop-ca.key -CAcreateserial \
+  -days 730 -out aop-client.pem
+chmod 600 *.key
+openssl verify -CAfile aop-ca.pem aop-client.pem     # expect: aop-client.pem: OK
+```
+
+| File | Ai giữ | Ghi chú |
+|---|---|---|
+| `aop-ca.pem` | VPS (Traefik) | Public, chỉ dùng để verify |
+| `aop-client.pem` + `aop-client.key` | **Chỉ Cloudflare** | Lộ key → gắn vào Postman/curl là gọi thẳng IP được |
+| `aop-ca.key` | **Chỉ bạn** (vault/offline) | Dùng lại khi ký cert mới; lộ → tự ký client cert hợp lệ |
+
+Không tạo trên VPS: `/etc/dokploy/traefik/dynamic/` hiện trên UI Dokploy (Traefik File System) và nằm trong backup/snapshot.
+
+**Bước 2 — Traefik chế độ mềm** (`VerifyClientCertIfGiven`: chỉ verify nếu client gửi cert → chưa chặn ai):
+
+```bash
+scp ~/aop/aop-ca.pem <vps>:/tmp/aop-ca.pem
+# trên VPS
+sudo mv /tmp/aop-ca.pem /etc/dokploy/traefik/dynamic/certificates/aop-ca.pem
+sudo tee /etc/dokploy/traefik/dynamic/aop.yml > /dev/null <<'YAML'
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      clientAuth:
+        caFiles:
+          - /etc/dokploy/traefik/dynamic/certificates/aop-ca.pem
+        clientAuthType: VerifyClientCertIfGiven
+YAML
+docker exec dokploy-traefik ls /etc/dokploy/traefik/dynamic/certificates/aop-ca.pem   # container thấy file
+```
+
+Đặt tên `default` để mọi TLS router (kể cả router Dokploy tạo sau) đều bị áp. Khi hai router xung đột TLS option, Traefik fallback về `default` → vẫn giữ mTLS. File trong `dynamic/` hot-reload, không cần restart.
+
+**Bước 3 — Upload client cert lên Cloudflare (chưa bật):**
+
+1. **SSL/TLS** ➔ **Origin Server** ➔ tab **Authenticated Origin Pulls** ➔ mục **Zone-level** ➔ **Upload certificate**.
+2. Certificate: `pbcopy < ~/aop/aop-client.pem` → dán. Private key: `pbcopy < ~/aop/aop-client.key` → dán. (Phải là **leaf cert**; upload CA sẽ lỗi `missing leaf certificate`.)
+3. **Continue** ➔ **Done**, kiểm tra status **active**.
+
+**Bước 4 — Bật AOP:** cùng trang, toggle **Zone-level** ➔ **On**. Traefik vẫn đang mềm → không ai bị chặn.
+
+**Bước 5 — Chuyển Traefik sang cứng** (kèm auto-rollback nếu host nào không còn 200):
+
+```bash
+ssh <vps> 'sudo sed -i "s/VerifyClientCertIfGiven/RequireAndVerifyClientCert/" /etc/dokploy/traefik/dynamic/aop.yml'
+sleep 8
+fail=0
+for u in https://<your_domain.com> https://dokploy.<your_domain.com> https://auth.<your_domain.com>/.well-known/openid-configuration; do
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$u"); echo "$u $c"; [ "$c" = 200 ] || fail=1
+done
+[ $fail = 1 ] && ssh <vps> 'sudo sed -i "s/RequireAndVerifyClientCert/VerifyClientCertIfGiven/" /etc/dokploy/traefik/dynamic/aop.yml' && echo ROLLED BACK
+```
+
+> ⚠️ **Thứ tự quan trọng:** bên gửi cert (CF, bước 4) bật trước, bên bắt buộc cert (Traefik, bước 5) bật sau. Làm ngược → toàn bộ site lỗi trong khoảng giữa hai bước.
+
+**Bước 6 — Verify:**
+
+```bash
+for u in https://<your_domain.com> https://dokploy.<your_domain.com> https://auth.<your_domain.com>/.well-known/openid-configuration; do
+  h=$(echo $u | cut -d/ -f3)
+  echo "$h via CF   : $(curl -s -o /dev/null -w '%{http_code}' $u)"                                     # expect 200
+  echo "$h direct IP: $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve $h:443:<VPS_IP> $u)"  # expect 000
+done
+
+# Chứng minh chặn là do cert (không phải mạng đứt) — chạy TRƯỚC khi xoá client key
+curl -s -o /dev/null -w '%{http_code}\n' --cert ~/aop/aop-client.pem --key ~/aop/aop-client.key \
+  --resolve auth.<your_domain.com>:443:<VPS_IP> https://auth.<your_domain.com>/.well-known/openid-configuration   # expect 200
+```
+
+`000` có thể do firewall chặn nhầm; lần gọi có cert ra `200` mới chứng minh Traefik đang lọc theo cert.
+
+**Bước 7 — Dọn key:**
+
+```bash
+cd ~/aop && rm aop-client.key aop-client.csr aop-ca.srl    # CF đã giữ client key
+```
+
+Chuyển `aop-ca.key` vào password manager / USB offline rồi xoá khỏi máy (Desktop/Documents thường bị iCloud sync + Time Machine backup).
+
+**Rollback:**
+
+| Lỗi ở | Làm |
+|---|---|
+| Bước 2 / 5 | `sudo rm /etc/dokploy/traefik/dynamic/aop.yml` (hot-reload) |
+| Bước 4 | Toggle Zone-level ➔ **Off** |
+
+### 7.5. Vận hành
+
+- **Gia hạn:** cert riêng không tự xoay. Đặt lịch nhắc trước hạn (ví dụ trên: 730 ngày; CF gửi mail nhắc trước 30 và 14 ngày). Xoay: ký cert mới bằng `aop-ca.key` → upload lên CF → xác nhận active → xoá cert cũ (chỉ nên để 1 cert active).
+- **Port 80 không có mTLS:** router HTTP chỉ được redirect sang HTTPS, không phục vụ nội dung.
+- **Gọi nội bộ:** health check hay app trong VPS gọi `https://<host>` mà resolve về IP gốc sẽ bị chặn → trong cùng Docker network, gọi thẳng tên service.
+
+Docs: [Cloudflare SSL modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/) · [Cloudflare AOP](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull) · [AOP manage certificates](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/manage-certificates) · [Traefik v3.6 TLS options](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/tls/tls-options/)
