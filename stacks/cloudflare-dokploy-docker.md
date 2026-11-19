@@ -465,76 +465,32 @@ Chuyển `aop-ca.key` vào password manager / USB offline rồi xoá khỏi máy
 ### 7.5. Vận hành
 
 - **Gia hạn:** cert riêng không tự xoay. Đặt lịch nhắc trước hạn (ví dụ trên: 730 ngày; CF gửi mail nhắc trước 30 và 14 ngày). Xoay: ký cert mới bằng `aop-ca.key` → upload lên CF → xác nhận active → xoá cert cũ (chỉ nên để 1 cert active).
-- **Port 80 không có mTLS:** đóng hẳn từ ngoài (xem §8). Nếu còn mở thì router HTTP chỉ được redirect sang HTTPS, không phục vụ nội dung.
+- **Port 80 không có mTLS:** router HTTP chỉ được redirect sang HTTPS, không phục vụ nội dung (xem §8).
 - **Gọi nội bộ:** health check hay app trong VPS gọi `https://<host>` mà resolve về IP gốc sẽ bị chặn → trong cùng Docker network, gọi thẳng tên service.
 
 Docs: [Cloudflare SSL modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/) · [Cloudflare AOP](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull) · [AOP manage certificates](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/manage-certificates) · [Traefik v3.6 TLS options](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/tls/tls-options/)
 
-## 8. Đóng port 80 ở origin (khuyến nghị)
+## 8. Port 80 ở origin — để mặc định của Dokploy
 
-> **Vấn đề:** AOP chỉ bảo vệ `:443`. Gõ `http://<VPS_IP>` vẫn tới Traefik ở `:80` → trả `404 page not found` (hoặc `301` cho host có router HTTP). Không lộ nội dung app, nhưng vẫn fingerprint được Traefik và là một đường vào không qua Cloudflare.
+> **Hiện tượng:** AOP chỉ bảo vệ `:443`. Gõ `http://<VPS_IP>` vẫn tới Traefik ở `:80` → `404 page not found` (hoặc `301 → https` cho host có router HTTP).
 
-**Vì sao đóng được mà không vỡ gì:**
+**Quyết định: giữ `:80` mở như mặc định Dokploy, không tự chế thêm.**
 
-- User gõ `http://<host>` → **Cloudflare edge** tự trả `301 → https` (`Server: cloudflare`), request không xuống origin. Kiểm tra: `curl -sI http://<host> | grep -i ^server` phải ra `cloudflare`. Nếu chưa, bật **SSL/TLS ➔ Edge Certificates ➔ Always Use HTTPS** trước — ở mode Full, CF đi xuống origin theo scheme của visitor, nên thiếu bước này mà đóng `:80` sẽ gây lỗi `52x` cho visitor dùng `http://`.
-- SSL mode Full (strict) → CF luôn kết nối origin qua `:443`.
-- Cert lấy qua **DNS-01** → Let's Encrypt không cần `:80`. (Nếu sau này thêm domain dùng HTTP-01 thì phải mở lại.)
+- Dokploy **không có toggle tắt port 80** (chỉ có toggle tắt `:3000`, bật Dashboard `:8080`, và Additional Port Mappings để *thêm* port) — xem [Dokploy Web Server](https://docs.dokploy.com/docs/core/web-server). Port `80:80` của Traefik do Dokploy quản lý; sửa tay (gỡ publish, bỏ entrypoint `web`, rule `DOCKER-USER` + systemd) là ngoài luồng Dokploy, dễ bị ghi đè hoặc phải tự bảo trì.
+- `:80` **không lộ nội dung**: chỉ `404` hoặc `301` sang HTTPS → đi tiếp qua Cloudflare + AOP. Nội dung thật nằm ở `:443`, đã được AOP chặn.
+- User gõ `http://<host>` được **Cloudflare edge** redirect (`Server: cloudflare`), không xuống origin. Kiểm tra: `curl -sI http://<host> | grep -i ^server`. Nếu chưa ra `cloudflare`, bật **SSL/TLS ➔ Edge Certificates ➔ Always Use HTTPS**.
 
-**Không sửa Traefik/Dokploy:** port `80:80` do Dokploy quản lý container Traefik, router HTTP trong `dynamic/dokploy.yml` do Dokploy sinh ra → sửa tay sẽ bị ghi đè. Chặn ở `DOCKER-USER` (giống §5.3) bền hơn.
+**UFW:** có thể xoá rule `allow 80/tcp` cho gọn (`sudo ufw delete allow 80/tcp`), nhưng **không có tác dụng chặn**: port do Docker publish đi qua `FORWARD`, không qua `INPUT` của UFW (xem sơ đồ §5). Sau khi xoá, `curl http://<VPS_IP>/` vẫn ra `404` — đúng như dự đoán.
 
-**Apply + persist** bằng systemd unit idempotent (không dùng `iptables-persistent`: `netfilter-persistent save` lưu cả rule Docker tự sinh, restore lúc boot dễ lệch với Docker):
-
-```bash
-sudo tee /usr/local/sbin/docker-user-rules.sh > /dev/null <<'SH'
-#!/bin/sh
-set -e
-EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
-for ipt in iptables ip6tables; do
-  $ipt -N DOCKER-USER 2>/dev/null || true
-  $ipt -C DOCKER-USER -i "$EXT_IF" -p tcp --dport 80 -j DROP 2>/dev/null \
-    || $ipt -I DOCKER-USER -i "$EXT_IF" -p tcp --dport 80 -j DROP
-done
-SH
-sudo chmod 755 /usr/local/sbin/docker-user-rules.sh
-
-sudo tee /etc/systemd/system/docker-user-rules.service > /dev/null <<'UNIT'
-[Unit]
-Description=Drop external traffic to published port 80 (origin only reachable via Cloudflare on 443)
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/docker-user-rules.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=docker.service
-UNIT
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now docker-user-rules.service
-```
-
-`-C ... || -I ...` → chạy lại bao nhiêu lần cũng chỉ có 1 rule. `PartOf`/`WantedBy=docker.service` → Docker restart hay reboot đều áp lại. Scope `-i $EXT_IF` vì lý do như §5.3 (không chặn traffic nội bộ giữa container).
-
-**Verify:**
+**Verify trạng thái đúng:**
 
 ```bash
-sudo iptables -S DOCKER-USER; sudo ip6tables -S DOCKER-USER     # có rule --dport 80 -j DROP
-curl -s -o /dev/null -w '%{http_code}\n' --max-time 6 http://<VPS_IP>/       # expect 000
-curl -s -o /dev/null -w '%{http_code}\n' http://<host>/                       # expect 301 (từ CF edge)
-curl -s -o /dev/null -w '%{http_code}\n' https://<host>/                      # expect 200
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 6 http://<VPS_IP>/      # 404 (Traefik, không có nội dung)
+curl -s -o /dev/null -w '%{http_code}\n' http://<host>/                      # 301 (từ CF edge)
+curl -s -o /dev/null -w '%{http_code}\n' https://<host>/                     # 200
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 8 --resolve <host>:443:<VPS_IP> https://<host>/   # 000 (AOP chặn)
 ```
 
-**Rollback:**
+Nếu sau này cần đóng hẳn `:80`, ưu tiên **firewall của nhà cung cấp VPS** (chặn trước khi tới máy, không dính Docker) thay vì chế rule trên VPS.
 
-```bash
-sudo systemctl disable --now docker-user-rules.service
-EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
-sudo iptables  -D DOCKER-USER -i $EXT_IF -p tcp --dport 80 -j DROP
-sudo ip6tables -D DOCKER-USER -i $EXT_IF -p tcp --dport 80 -j DROP
-```
-
-**Kết quả sau §5 + §7 + §8:** từ Internet, origin chỉ còn nhận `:443` có client cert của Cloudflare. `IP:3000` đã gỡ publish, `IP:80` drop, `IP:443` không có cert bị cắt ở TLS handshake.
+**Kết quả sau §5 + §7 + §8:** `IP:3000` đã gỡ publish, `IP:80` chỉ trả 404/redirect, `IP:443` không có client cert của Cloudflare bị cắt ở TLS handshake.
