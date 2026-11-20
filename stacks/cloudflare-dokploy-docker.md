@@ -357,6 +357,7 @@ Hai chiều dùng hai cert khác nhau: server cert (Let's Encrypt) cho ①, clie
 ### 7.3. Điều kiện trước khi bật
 
 - Mọi record trỏ về VPS phải **Proxied** (đám mây cam). Record `DNS only` ở bước 1 chỉ là tạm thời — bật cam lại sau khi setup xong. Host nào còn `DNS only` sẽ bị chặn khi bật AOP.
+- **Ngoại lệ bắt buộc — host mail (MX):** record MX phải `DNS only` vì CF không proxy SMTP/IMAP. Nếu host đó còn chạy web (webmail) qua Traefik `:443` thì HTTPS sẽ bị chặn, vì `tls.options.default` áp cho **mọi** router TLS. Liệt kê **toàn bộ** record trỏ về VPS (A, MX, CNAME) trước khi bật, đừng chỉ kiểm tra các host app. Cách xử lý ở §7.5.
 - SSL/TLS mode = **Full (strict)** (AOP không chạy với Off/Flexible).
 - Cert dùng **DNS-01** (bước 3) → không ảnh hưởng. TLS-ALPN-01 sẽ vỡ khi bật mTLS.
 
@@ -467,6 +468,22 @@ Chuyển `aop-ca.key` vào password manager / USB offline rồi xoá khỏi máy
 - **Gia hạn:** cert riêng không tự xoay. Đặt lịch nhắc trước hạn (ví dụ trên: 730 ngày; CF gửi mail nhắc trước 30 và 14 ngày). Xoay: ký cert mới bằng `aop-ca.key` → upload lên CF → xác nhận active → xoá cert cũ (chỉ nên để 1 cert active).
 - **Port 80 không có mTLS:** router HTTP chỉ được redirect sang HTTPS, không phục vụ nội dung (xem §8).
 - **Gọi nội bộ:** health check hay app trong VPS gọi `https://<host>` mà resolve về IP gốc sẽ bị chặn → trong cùng Docker network, gọi thẳng tên service.
+- **Miễn mTLS cho host `DNS only` (vd webmail trên host MX):** tạo TLS option riêng không có `clientAuth` rồi gắn vào đúng router đó. Host này đi thẳng vào origin → không có WAF/rate limit của CF; nếu đổi được URL, nên tách webmail sang host Proxied (vd `webmail.<domain>`) thay vì miễn.
+
+  ```yaml
+  # /etc/dokploy/traefik/dynamic/tls-no-client-auth.yml (hot-reload)
+  tls:
+    options:
+      no-client-auth:
+        minVersion: VersionTLS12
+  ```
+
+  ```yaml
+  # label của service trong compose (sửa ở repo nguồn, Dokploy redeploy)
+  - 'traefik.http.routers.<router>.tls.options=no-client-auth@file'
+  ```
+
+  Verify: `curl https://<mail-host>/` → `200`; `openssl s_client -connect <mail-host>:443` không còn `Acceptable client certificate CA names`; các host khác `curl --resolve <host>:443:<ORIGIN_IP>` vẫn `000`.
 
 Docs: [Cloudflare SSL modes](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/) · [Cloudflare AOP](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull) · [AOP manage certificates](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/manage-certificates) · [Traefik v3.6 TLS options](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/tls/tls-options/)
 
